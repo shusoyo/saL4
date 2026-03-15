@@ -6,27 +6,23 @@
 #![cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
 
 // 引入控制台输出宏（print! / println!），由 tg_console 库提供
-#[macro_use]
-extern crate tg_console;
 
 mod boot;
 mod cap;
 mod config;
 mod impls;
-mod syscall_gate;
+mod utils;
 
-use impls::{Console, SyscallContext};
+use impls::Console;
 
-use cap::threads::Tcb;
-use syscall_gate::TrapAction;
+// riscv 库：访问 RISC-V 控制状态寄存器（CSR），如 scause
+// use riscv::register::*;
 
 use tg_console::log;
 use tg_sbi::shutdown;
 
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(include_str!("entry.asm"));
-#[cfg(target_arch = "riscv64")]
-core::arch::global_asm!(include_str!(env!("APP_ASM")));
 
 /// S 态主函数：打印 "Hello, world!" 并关机。
 ///
@@ -44,42 +40,12 @@ pub fn rust_main() -> ! {
     tg_console::set_log_level(option_env!("LOG"));
     tg_console::test_log();
 
-    tg_syscall::init_io(&SyscallContext);
-    tg_syscall::init_process(&SyscallContext);
+    // boot
 
-    run_apps();
-
-    log::info!("hello world");
+    log::info!("hello, world");
 
     shutdown(false) // false 表示正常关机
 }
-
-#[cfg(target_arch = "riscv64")]
-fn run_apps() {
-    for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
-        let entry = app.as_ptr() as usize;
-        log::info!("load app{} at {:#x}", i, entry);
-
-        let mut user_stack = [0usize; 512];
-        let sp = user_stack.as_mut_ptr() as usize + core::mem::size_of_val(&user_stack);
-
-        let mut tcb = Tcb::new(i, entry, sp, 0x100 + i);
-
-        while tcb.alive {
-            unsafe { tcb.ctx.execute() };
-            match syscall_gate::handle_trap(&mut tcb) {
-                TrapAction::Continue => continue,
-                TrapAction::Exit | TrapAction::Killed => break,
-            }
-        }
-
-        let _ = core::hint::black_box(&user_stack);
-        println!();
-    }
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn run_apps() {}
 
 /// language item
 /// panic 处理函数。

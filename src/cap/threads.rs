@@ -1,24 +1,30 @@
 use tg_kernel_context::LocalContext;
 
+use crate::cap::Capability;
+
+#[repr(C)]
 pub struct Tcb {
-    pub id: usize,
-    pub alive: bool,
     pub ctx: LocalContext,
-    pub cspace: crate::cap::CSpace,
-    pub write_badge: usize,
+    pub cspace_root: Capability,
+    pub vspace_root: Capability,
+    pub state: ThreadState,
 }
 
 impl Tcb {
-    pub fn new(id: usize, entry: usize, sp: usize, badge: usize) -> Self {
-        let mut ctx = LocalContext::user(entry);
-        *ctx.sp_mut() = sp;
-
+    pub const fn empty() -> Self {
         Self {
-            id,
-            alive: true,
-            ctx,
-            cspace: crate::boot::BootManager::bootstrap_cspace_for_task(badge),
-            write_badge: badge,
+            ctx: LocalContext::empty(),
+            cspace_root: Capability::Null,
+            vspace_root: Capability::Null,
+            state: ThreadState::Inactive,
         }
     }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ThreadState {
+    Inactive,
+    Running,
+    BlockedOnReceive,
+    BlockedOnSend,
 }

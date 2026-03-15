@@ -1,43 +1,65 @@
+#![allow(dead_code)]
+
 pub mod threads;
 
-use crate::config;
+use core::ptr::NonNull;
 
 #[derive(Debug, Copy, Clone)]
-pub struct EndpointCap {
-    pub badge: usize,
+pub struct UntypedCap {
+    pub paddr: usize,
+    pub size_bits: u8,
+    pub is_device: bool,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct CNodeCap {
+    pub storage: NonNull<Slot>,
+    pub radix_bits: u8,
+    pub guard_size: u8,
+    pub guard: usize,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct TCBCap {
+    pub ptr: NonNull<threads::Tcb>,
 }
 
 #[derive(Debug, Copy, Clone)]
 pub enum Capability {
     Null,
-    Endpoint(EndpointCap),
-    Tcb,
+    Untyped(UntypedCap),
+    CNode(CNodeCap),
+    Tcb(TCBCap),
 }
 
 #[derive(Debug, Copy, Clone)]
-pub struct CSpace {
-    pub slots: [Capability; config::NULL_CSPACE_SLOTS],
+pub struct MDBNode {
+    pub parent: Option<NonNull<Slot>>,
+    pub next: Option<NonNull<Slot>>,
+    pub prev: Option<NonNull<Slot>>,
 }
 
-impl CSpace {
+impl MDBNode {
     pub const fn empty() -> Self {
         Self {
-            slots: [Capability::Null; config::NULL_CSPACE_SLOTS],
+            parent: None,
+            next: None,
+            prev: None,
         }
     }
+}
 
-    pub const fn for_null_kernel(badge: usize) -> Self {
-        let mut cspace = Self::empty();
-        cspace.slots[1] = Capability::Endpoint(EndpointCap { badge });
-        cspace.slots[2] = Capability::Tcb;
-        cspace
-    }
+#[derive(Debug, Copy, Clone)]
+pub struct Slot {
+    pub cap: Capability,
+    pub mdb: MDBNode,
+}
 
-    pub fn lookup(&self, slot_index: usize) -> Option<Capability> {
-        if slot_index >= self.slots.len() {
-            None
-        } else {
-            Some(self.slots[slot_index])
+impl Slot {
+    pub const fn empty() -> Self {
+        Self {
+            cap: Capability::Null,
+            mdb: MDBNode::empty(),
         }
     }
 }
