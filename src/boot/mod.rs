@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::{
-    cap::{CNodeCap, Capability, Slot, TCBCap, UntypedCap, threads::Tcb},
+    cap::{CNodeCap, Capability, FrameCap, IRQControlCap, Slot, TCBCap, UntypedCap, threads::Tcb},
     config,
     utils::CPtr,
 };
@@ -9,13 +9,14 @@ use core::{
     mem::{align_of, size_of},
     ptr::NonNull,
 };
+use tg_console::log;
 
-struct EarlyAllocator {
+struct BootArena {
     current: usize,
     end: usize,
 }
 
-impl EarlyAllocator {
+impl BootArena {
     fn new(start: usize, end: usize) -> Self {
         Self {
             current: Self::align_up(start, config::PAGE_SIZE),
@@ -24,18 +25,55 @@ impl EarlyAllocator {
     }
 
     fn align_up(x: usize, align: usize) -> usize {
-        assert!(align != 0, "align must not be zero");
-        let rem = x % align;
-        if rem == 0 { x } else { x + (align - rem) }
+        assert!(align.is_power_of_two(), "align must be 2^n");
+        x.checked_add(align - 1).expect("overflow") & !(align - 1)
     }
 
-    fn alloc(&mut self, size: usize, align: usize) -> usize {
+    fn alloc_typed<T>(&mut self) -> NonNull<T> {
+        let align = align_of::<T>();
+
+        let size = size_of::<T>();
         assert!(align != 0, "align must not be zero");
+
         self.current = Self::align_up(self.current, align);
-        let addr = self.current;
+        let ptr = self.current as *mut T;
         self.current += size;
         assert!(self.current <= self.end, "Out of memory during bootstrap");
-        addr
+
+        unsafe {
+            // Boot-time kernel objects start from a deterministic zeroed state.
+            core::ptr::write_bytes(ptr, 0, 1);
+            NonNull::new_unchecked(ptr)
+        }
+    }
+
+    fn alloc_slots(&mut self, count: usize) -> NonNull<Slot> {
+        let align = align_of::<Slot>();
+        assert!(align != 0, "align must not be zero");
+
+        self.current = Self::align_up(self.current, align);
+        let ptr = self.current as *mut Slot;
+
+        self.current += size_of::<Slot>() * count;
+        assert!(self.current <= self.end, "Out of memory during bootstrap");
+
+        unsafe {
+            core::ptr::write_bytes(ptr, 0, count);
+            NonNull::new_unchecked(ptr)
+        }
+    }
+
+    fn alloc_page_paddr(&mut self) -> usize {
+        self.current = Self::align_up(self.current, config::PAGE_SIZE);
+        let paddr = self.current;
+        self.current += config::PAGE_SIZE;
+        assert!(self.current <= self.end, "Out of memory during bootstrap");
+
+        unsafe {
+            core::ptr::write_bytes(paddr as *mut u8, 0, config::PAGE_SIZE);
+        }
+
+        paddr
     }
 
     fn cursor(&self) -> usize {
@@ -43,24 +81,36 @@ impl EarlyAllocator {
     }
 }
 
-struct ReservedLayout {
-    bootinfo_ptr: usize,
-    cnode_ptr: usize,
-    cnode_slots: usize,
-    tcb_ptr: usize,
-    untyped_start_paddr: usize,
+struct UntypedStream {
+    current_paddr: usize,
+    end_paddr: usize,
 }
 
-struct UntypedBootstrap {
-    count: usize,
-    paddr_list: [usize; config::MAX_UNTYPED_OBJECTS],
-    size_bits_list: [u8; config::MAX_UNTYPED_OBJECTS],
+impl Iterator for UntypedStream {
+    type Item = (usize, u8);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let remain = self.end_paddr.saturating_sub(self.current_paddr);
+        if remain < config::PAGE_SIZE {
+            return None;
+        }
+
+        // Keep untyped in 2^n sizes (seL4-like model), but use clear arithmetic checks
+        let s_paddr_bits = self.current_paddr.trailing_zeros();
+        let remain_bits = remain.ilog2();
+        let size_bits = s_paddr_bits.min(remain_bits);
+
+        let paddr = self.current_paddr;
+        self.current_paddr += 1usize << size_bits;
+        Some((paddr, size_bits as u8))
+    }
 }
 
 #[repr(C)]
 pub struct SlotRegion {
-    // [start, end)
+    /// Inclusive start and exclusive end slot indices in the root cnode.
     pub start: CPtr,
+    /// Inclusive start and exclusive end slot indices in the root cnode.
     pub end: CPtr,
 }
 
@@ -69,233 +119,250 @@ pub struct BootInfo {
     // pub node_id: usize,
     // pub num_nodes: usize,
     // pub ipc_buffer_vaddr: usize,
+    /// Radix bits of the initial thread's root cnode.
     pub init_thread_cnode_size_bits: u8,
 
+    /// Unused root cnode slots available after bootstrap.
     pub empty: SlotRegion,
+    /// Root cnode slots that would describe the initial user image frames.
+    ///
+    /// This chapter leaves the region empty until user-image mapping exists.
     pub user_image_frames: SlotRegion,
-    pub user_image_paging: SlotRegion,
+    /// Root cnode slots holding the exported untyped capabilities.
     pub untyped: SlotRegion,
 
+    /// Physical base address of each exported untyped capability.
     pub untyped_paddr_list: [usize; config::MAX_UNTYPED_OBJECTS],
+    /// Size bits of each exported untyped capability.
     pub untyped_size_bits_list: [u8; config::MAX_UNTYPED_OBJECTS],
     // pub fdt_paddr: usize,
     // pub fdt_size: usize,
 }
 
-pub struct BootManager;
+const _: () = {
+    assert!(config::ROOT_CNODE_SLOTS == (1usize << config::ROOT_CNODE_RADIX_BITS));
+    assert!(config::ROOT_CNODE_SLOT_NULL < config::ROOT_CNODE_SLOTS);
+    assert!(config::ROOT_CNODE_SLOT_TCB < config::ROOT_CNODE_SLOTS);
+    assert!(config::ROOT_CNODE_SLOT_CNODE < config::ROOT_CNODE_SLOTS);
+    assert!(config::ROOT_CNODE_SLOT_IRQ_CTRL < config::ROOT_CNODE_SLOTS);
+    assert!(config::ROOT_CNODE_SLOT_BOOTINFO_FRAME < config::ROOT_CNODE_SLOTS);
+    assert!(config::ROOT_CNODE_SLOT_IPC_BUFFER < config::ROOT_CNODE_SLOTS);
+    assert!(config::FIRST_USER_IMAGE_FRAME_SLOT <= config::ROOT_CNODE_SLOTS);
+};
 
-impl BootManager {
-    /*
-    1. 物理内存探测：找到所有的空闲内存块（Free Memory）。
+/*
+1. 物理内存探测：找到所有的空闲内存块（Free Memory）。
 
-    2. 内核预留：
-      - 从 Free Memory 中切出一块给 BootInfo。
-      - 从 Free Memory 中切出一块给 Root Task 的 TCB。
-      - 从 Free Memory 中切出一块给 Root Task 的 VSpace (顶级页表)。
-      - 从 Free Memory 中切出一块给 Root Task 的 CNode（这是最重要的资源池）。
+2. 内核预留：
+  - 从 Free Memory 中切出一块给 BootInfo。
+  - 从 Free Memory 中切出一块给 Root Task 的 TCB。
+  - (TODO) 从 Free Memory 中切出一块给 Root Task 的 VSpace (顶级页表)。
+  - 从 Free Memory 中切出一块给 Root Task 的 CNode。
 
-    3. 能力映射：
-      - 把剩余的所有 Free Memory 封装成 Untyped 条目。
-      - 把这些条目通通写进 CNode 空间。
-      - 把这些条目的物理地址和大小写进 BootInfo。
-    */
-    pub fn bootstrap(&mut self) {
-        let (free_memory_start, free_memory_end) = self.probe_free_memory();
-        let reserved = self.reserve_boot_objects(free_memory_start, free_memory_end);
+3. 能力映射：
+  - 把剩余的所有 Free Memory 封装成 Untyped 条目。
+  - 把这些条目通通写进 CNode 空间。
+  - 把这些条目的物理地址和大小写进 BootInfo。
+*/
+pub fn bootstrap() {
+    let (free_memory_start, free_memory_end) = probe_free_memory();
+    log::info!(
+        "[boot] free memory: start={:#x}, end={:#x}, size={:#x}",
+        free_memory_start,
+        free_memory_end,
+        free_memory_end.saturating_sub(free_memory_start)
+    );
 
-        let cnode_storage = self.init_root_cnode_storage(reserved.cnode_ptr, reserved.cnode_slots);
-        self.install_initial_caps(cnode_storage, reserved.tcb_ptr);
+    let mut arena = BootArena::new(free_memory_start, free_memory_end);
 
-        let untyped = self.populate_untyped_caps(
-            cnode_storage,
-            reserved.untyped_start_paddr,
-            free_memory_end,
-            reserved.cnode_slots,
+    let bootinfo_ptr = arena.alloc_typed::<BootInfo>();
+    let root_cnode_ptr = arena.alloc_slots(config::ROOT_CNODE_SLOTS);
+    let root_tcb_ptr = arena.alloc_typed::<Tcb>();
+    let ipc_buffer_paddr = arena.alloc_page_paddr();
+
+    log::info!(
+        "[boot] allocated boot objects: bootinfo={:#x}, cnode={:#x} (slots={}), tcb={:#x}, ipc={:#x}",
+        bootinfo_ptr.as_ptr() as usize,
+        root_cnode_ptr.as_ptr() as usize,
+        config::ROOT_CNODE_SLOTS,
+        root_tcb_ptr.as_ptr() as usize,
+        ipc_buffer_paddr,
+    );
+
+    let bootinfo = unsafe { &mut *bootinfo_ptr.as_ptr() };
+    let root_tcb = unsafe { &mut *root_tcb_ptr.as_ptr() };
+    let root_cnode = unsafe {
+        core::slice::from_raw_parts_mut(root_cnode_ptr.as_ptr(), config::ROOT_CNODE_SLOTS)
+    };
+
+    install_initial_caps(
+        root_cnode,
+        root_tcb,
+        bootinfo_ptr.as_ptr() as usize,
+        ipc_buffer_paddr,
+    );
+
+    let untyped_start = BootArena::align_up(arena.cursor(), config::PAGE_SIZE);
+    let first_untyped_slot = populate_user_image_frame_caps(root_cnode, bootinfo);
+    populate_untyped_caps(
+        untyped_start,
+        free_memory_end,
+        first_untyped_slot,
+        root_cnode,
+        bootinfo,
+    );
+
+    bootinfo.init_thread_cnode_size_bits = config::ROOT_CNODE_RADIX_BITS;
+}
+
+fn probe_free_memory() -> (usize, usize) {
+    // [__end, __end + EARLY_BOOT_MEMORY_SIZE) is treated as free memory for early boot.
+    let locate = tg_linker::KernelLayout::locate();
+    let free_memory_start = locate.end();
+    let free_memory_end = free_memory_start + config::EARLY_BOOT_MEMORY_SIZE;
+    (free_memory_start, free_memory_end)
+}
+
+fn install_initial_caps(
+    cnode: &mut [Slot],
+    tcb: &mut Tcb,
+    bootinfo_paddr: usize,
+    ipc_paddr: usize,
+) {
+    let cnode_storage = NonNull::from(&mut *cnode).cast::<Slot>();
+    let root_cnode_cap = Capability::CNode(CNodeCap {
+        storage: cnode_storage,
+        radix_bits: config::ROOT_CNODE_RADIX_BITS,
+        guard_size: usize::BITS as u8 - config::ROOT_CNODE_RADIX_BITS,
+        guard: 0,
+    });
+
+    // Materialize the root TCB object before publishing a capability to it.
+    *tcb = Tcb {
+        cspace_root: root_cnode_cap,
+        ..Tcb::empty()
+    };
+
+    cnode[config::ROOT_CNODE_SLOT_CNODE] = Slot {
+        cap: root_cnode_cap,
+        mdb: crate::cap::MDBNode::empty(),
+    };
+
+    cnode[config::ROOT_CNODE_SLOT_TCB] = Slot {
+        cap: Capability::Tcb(TCBCap {
+            ptr: NonNull::from(&mut *tcb),
+        }),
+        mdb: crate::cap::MDBNode::empty(),
+    };
+
+    cnode[config::ROOT_CNODE_SLOT_IRQ_CTRL] = Slot {
+        cap: Capability::IRQControl(IRQControlCap),
+        mdb: crate::cap::MDBNode::empty(),
+    };
+
+    cnode[config::ROOT_CNODE_SLOT_BOOTINFO_FRAME] = Slot {
+        cap: Capability::Frame(FrameCap {
+            paddr: bootinfo_paddr,
+            size_bits: config::MIN_UNTYPED_SIZE_BITS,
+        }),
+        mdb: crate::cap::MDBNode::empty(),
+    };
+
+    cnode[config::ROOT_CNODE_SLOT_IPC_BUFFER] = Slot {
+        cap: Capability::Frame(FrameCap {
+            paddr: ipc_paddr,
+            size_bits: config::MIN_UNTYPED_SIZE_BITS,
+        }),
+        mdb: crate::cap::MDBNode::empty(),
+    };
+}
+
+fn populate_user_image_frame_caps(cnode: &mut [Slot], bootinfo: &mut BootInfo) -> usize {
+    let start = config::FIRST_USER_IMAGE_FRAME_SLOT;
+    let end = start;
+
+    // TODO: Populate root task image frame caps once ELF physical extents are tracked.
+    bootinfo.user_image_frames = SlotRegion {
+        start: CPtr::new(start),
+        end: CPtr::new(end),
+    };
+
+    let _ = cnode;
+
+    end
+}
+
+fn populate_untyped_caps(
+    untyped_start: usize,
+    free_memory_end: usize,
+    first_untyped_slot: usize,
+    cnode: &mut [Slot],
+    bootinfo: &mut BootInfo,
+) {
+    let max_untyped = config::MAX_UNTYPED_OBJECTS
+        .min(config::ROOT_CNODE_SLOTS.saturating_sub(first_untyped_slot));
+
+    let stream = UntypedStream {
+        current_paddr: untyped_start,
+        end_paddr: free_memory_end,
+    };
+
+    let mut count = 0usize;
+    for (i, (paddr, size_bits)) in stream.take(max_untyped).enumerate() {
+        log::info!(
+            "[boot] alloctated untyped region, phys addr: [{:#X}, {:#X}), size bits: {size_bits}",
+            paddr,
+            paddr + (1 << size_bits)
         );
+        let slot_idx = first_untyped_slot + i;
 
-        self.write_bootinfo(reserved.bootinfo_ptr, reserved.cnode_slots, &untyped);
-    }
-
-    fn probe_free_memory(&self) -> (usize, usize) {
-        // [__end, __end + MEMORY_SIAE) is treated as free memory for early boot.
-        let locate = tg_linker::KernelLayout::locate();
-        let free_memory_start = locate.end();
-        let free_memory_end = free_memory_start + config::MEMORY_SIAE;
-        (free_memory_start, free_memory_end)
-    }
-
-    fn reserve_boot_objects(
-        &self,
-        free_memory_start: usize,
-        free_memory_end: usize,
-    ) -> ReservedLayout {
-        let mut allocator = EarlyAllocator::new(free_memory_start, free_memory_end);
-
-        let bootinfo_ptr = allocator.alloc(size_of::<BootInfo>(), config::PAGE_SIZE);
-
-        let cnode_slots = config::ROOT_CNODE_SLOTS;
-        let cnode_size = cnode_slots * size_of::<Slot>();
-        // CNode storage is kernel-private metadata, so natural type alignment is enough.
-        let cnode_ptr = allocator.alloc(cnode_size, align_of::<Slot>());
-
-        // TCB needs stable field offsets (repr(C)), but not page alignment here.
-        let tcb_ptr = allocator.alloc(size_of::<Tcb>(), align_of::<Tcb>());
-
-        ReservedLayout {
-            bootinfo_ptr,
-            cnode_ptr,
-            cnode_slots,
-            tcb_ptr,
-            untyped_start_paddr: EarlyAllocator::align_up(allocator.cursor(), config::PAGE_SIZE),
-        }
-    }
-
-    fn init_root_cnode_storage(&self, cnode_ptr: usize, cnode_slots: usize) -> NonNull<Slot> {
-        let cnode_storage = cnode_ptr as *mut Slot;
-        for i in 0..cnode_slots {
-            unsafe { cnode_storage.add(i).write(Slot::empty()) };
-        }
-        NonNull::new(cnode_storage).expect("cnode storage pointer must not be null")
-    }
-
-    fn install_initial_caps(&self, cnode_storage: NonNull<Slot>, tcb_ptr: usize) {
-        let root_cnode_cap = Capability::CNode(CNodeCap {
-            storage: cnode_storage,
-            radix_bits: config::ROOT_CNODE_RADIX_BITS,
-            guard_size: 0,
-            guard: 0,
-        });
-
-        let tcb_nn = NonNull::new(tcb_ptr as *mut Tcb).expect("tcb pointer must not be null");
-
-        // Materialize the root TCB object before publishing a capability to it.
-        unsafe {
-            tcb_nn.as_ptr().write(Tcb {
-                cspace_root: root_cnode_cap,
-                ..Tcb::empty()
-            });
-        }
-
-        unsafe {
-            cnode_storage
-                .as_ptr()
-                .add(config::ROOT_CNODE_SLOT)
-                .write(Slot {
-                    cap: root_cnode_cap,
-                    mdb: crate::cap::MDBNode::empty(),
-                });
-
-            cnode_storage
-                .as_ptr()
-                .add(config::ROOT_TCB_SLOT)
-                .write(Slot {
-                    cap: Capability::Tcb(TCBCap { ptr: tcb_nn }),
-                    mdb: crate::cap::MDBNode::empty(),
-                });
-        }
-    }
-
-    fn populate_untyped_caps(
-        &self,
-        cnode_storage: NonNull<Slot>,
-        untyped_start: usize,
-        free_memory_end: usize,
-        cnode_slots: usize,
-    ) -> UntypedBootstrap {
-        let mut paddr_list = [0usize; config::MAX_UNTYPED_OBJECTS];
-        let mut size_bits_list = [0u8; config::MAX_UNTYPED_OBJECTS];
-
-        let mut untyped_count = 0usize;
-        let mut untyped_paddr = untyped_start;
-        let max_untyped_by_slots = cnode_slots.saturating_sub(config::FIRST_UNTYPED_SLOT);
-        let max_untyped = core::cmp::min(config::MAX_UNTYPED_OBJECTS, max_untyped_by_slots);
-
-        while untyped_paddr < free_memory_end && untyped_count < max_untyped {
-            let remain = free_memory_end - untyped_paddr;
-            if remain < config::PAGE_SIZE {
-                break;
-            }
-
-            let (size_bits, block_size) = Self::pick_untyped_block(untyped_paddr, remain);
-
-            paddr_list[untyped_count] = untyped_paddr;
-            size_bits_list[untyped_count] = size_bits;
-
-            unsafe {
-                cnode_storage
-                    .as_ptr()
-                    .add(config::FIRST_UNTYPED_SLOT + untyped_count)
-                    .write(Slot {
-                        cap: Capability::Untyped(UntypedCap {
-                            paddr: untyped_paddr,
-                            size_bits,
-                            is_device: false,
-                        }),
-                        mdb: crate::cap::MDBNode::empty(),
-                    });
-            }
-
-            untyped_paddr += block_size;
-            untyped_count += 1;
-        }
-
-        UntypedBootstrap {
-            count: untyped_count,
-            paddr_list,
-            size_bits_list,
-        }
-    }
-
-    fn pick_untyped_block(paddr: usize, remain: usize) -> (u8, usize) {
-        // Keep untyped in 2^n sizes (seL4-like model), but use clear arithmetic checks
-        // instead of bit tricks to make intent explicit.
-        let mut size_bits = 12u8;
-        for candidate in (12u8..=(usize::BITS - 1) as u8).rev() {
-            let block_size = 1usize << candidate;
-            if block_size <= remain && paddr.is_multiple_of(block_size) {
-                size_bits = candidate;
-                break;
-            }
-        }
-
-        let block_size = 1usize << size_bits;
-
-        (size_bits, block_size)
-    }
-
-    fn write_bootinfo(&self, bootinfo_ptr: usize, cnode_slots: usize, untyped: &UntypedBootstrap) {
-        let bootinfo = BootInfo {
-            init_thread_cnode_size_bits: config::ROOT_CNODE_RADIX_BITS,
-            empty: SlotRegion {
-                start: CPtr::new(config::FIRST_UNTYPED_SLOT + untyped.count),
-                end: CPtr::new(cnode_slots),
-            },
-            // TODO: User image not populated yet.
-            user_image_frames: SlotRegion {
-                start: CPtr::new(0),
-                end: CPtr::new(0),
-            },
-            user_image_paging: SlotRegion {
-                start: CPtr::new(0),
-                end: CPtr::new(0),
-            },
-            untyped: SlotRegion {
-                start: CPtr::new(config::FIRST_UNTYPED_SLOT),
-                end: CPtr::new(config::FIRST_UNTYPED_SLOT + untyped.count),
-            },
-            untyped_paddr_list: untyped.paddr_list,
-            untyped_size_bits_list: untyped.size_bits_list,
+        cnode[slot_idx] = Slot {
+            cap: Capability::Untyped(UntypedCap {
+                paddr,
+                size_bits,
+                is_device: false,
+            }),
+            mdb: crate::cap::MDBNode::empty(),
         };
 
-        unsafe {
-            (bootinfo_ptr as *mut BootInfo).write(bootinfo);
-        }
+        bootinfo.untyped_paddr_list[i] = paddr;
+        bootinfo.untyped_size_bits_list[i] = size_bits;
+        count += 1;
     }
-    // fn bootstrap_untyped(&mut self);
-    // fn craft_initial_caps(&mut self);
+
+    bootinfo.empty = SlotRegion {
+        start: CPtr::new(first_untyped_slot + count),
+        end: CPtr::new(config::ROOT_CNODE_SLOTS),
+    };
+    bootinfo.untyped = SlotRegion {
+        start: CPtr::new(first_untyped_slot),
+        end: CPtr::new(first_untyped_slot + count),
+    };
 }
 
 /*
+Physical Address Space (RAM)                     Detailed Free Memory Layout (BootArena)
+      +-----------------------+ <--- RAM_END ---+-----------------------+ <--- free_memory_end
+      |                       |        |        |  Untyped Block (2^n)  |
+      |      Free Memory      |        |        |-----------------------|
+      |   (Detailed Right)    |--------+        |          ...          |
+      |                       |        |        |-----------------------| <--- untyped_start
+      |                       |        |        |/////// Padding ///////|
+      +=======================+ <--- __end -----+-----------------------+
+      |   Boot Stack (64KB)   |        ^        |   IPC Buffer (Page)   |
+      +-----------------------+        |        +-----------------------+
+      |    .bss (Zero-init)   |        |        |     Root Task TCB     |
+      +-----------------------+        |        +-----------------------+
+      |    .data / .rodata    |        |        |    Root CNode Slots   |
+      +-----------------------+        |        +-----------------------+
+      |   .text (Kernel)      |        |        |   BootInfo Structure  |
+      +-----------------------+        +--------+-----------------------+ <--- free_memory_start
+      |          ...          |                 (Allocated sequentially)
+      +-----------------------+
+      |   M-Mode Base / Stack |
+      +-----------------------+ <--- 0x0
+
+
 Physical Address Space (RAM)
       +---------------------------------------+ <--- RAM_END (e.g., 0x8800_0000)
       |                                       |
