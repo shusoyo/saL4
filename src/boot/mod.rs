@@ -9,7 +9,25 @@ use core::{
     mem::{align_of, size_of},
     ptr::NonNull,
 };
+use riscv::register::{
+    scause::{self, Exception, Trap},
+    stval, stvec,
+};
 use tg_console::log;
+use tg_kernel_context::LocalContext;
+use tg_sbi::shutdown;
+
+#[derive(Debug, Copy, Clone)]
+pub struct RootserverImage {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl RootserverImage {
+    pub const fn size(&self) -> usize {
+        self.end - self.start
+    }
+}
 
 struct BootArena {
     current: usize,
@@ -108,9 +126,9 @@ impl Iterator for UntypedStream {
 
 #[repr(C)]
 pub struct SlotRegion {
-    /// Inclusive start and exclusive end slot indices in the root cnode.
+    /// Inclusive start slot index in the root cnode.
     pub start: CPtr,
-    /// Inclusive start and exclusive end slot indices in the root cnode.
+    /// Exclusive end slot index in the root cnode.
     pub end: CPtr,
 }
 
@@ -123,12 +141,23 @@ pub struct BootInfo {
     pub init_thread_cnode_size_bits: u8,
 
     /// Unused root cnode slots available after bootstrap.
-    pub empty: SlotRegion,
-    /// Root cnode slots that would describe the initial user image frames.
     ///
-    /// This chapter leaves the region empty until user-image mapping exists.
+    /// `empty.start` is the first slot not consumed by the fixed boot-time
+    /// allocations below (`TCB`, `CNode`, `IRQ control`, `BootInfo` frame,
+    /// IPC buffer frame, rootserver image frames, exported untyped caps).
+    pub empty: SlotRegion,
+    /// Root cnode slots describing the loaded rootserver image frames.
+    ///
+    /// This region covers only the boot-time rootserver image that the kernel
+    /// copies to its fixed run address. It does not describe the BootInfo
+    /// frame, IPC buffer frame, rootserver stack, or any future user images
+    /// loaded by rootserver itself.
     pub user_image_frames: SlotRegion,
     /// Root cnode slots holding the exported untyped capabilities.
+    ///
+    /// This region starts after the fixed boot-time objects and excludes the
+    /// rootserver image, BootInfo frame, IPC buffer frame, and rootserver
+    /// stack reserved during bootstrap.
     pub untyped: SlotRegion,
 
     /// Physical base address of each exported untyped capability.
@@ -164,8 +193,15 @@ const _: () = {
   - 把这些条目通通写进 CNode 空间。
   - 把这些条目的物理地址和大小写进 BootInfo。
 */
-pub fn bootstrap() {
-    let (free_memory_start, free_memory_end) = probe_free_memory();
+pub fn bootstrap() -> ! {
+    let rootserver = locate_rootserver();
+    let (free_memory_start, free_memory_end) = probe_free_memory(rootserver);
+    log::info!(
+        "[boot] rootserver image: start={:#x}, end={:#x}, size={:#x}",
+        rootserver.start,
+        rootserver.end,
+        rootserver.size(),
+    );
     log::info!(
         "[boot] free memory: start={:#x}, end={:#x}, size={:#x}",
         free_memory_start,
@@ -179,14 +215,16 @@ pub fn bootstrap() {
     let root_cnode_ptr = arena.alloc_slots(config::ROOT_CNODE_SLOTS);
     let root_tcb_ptr = arena.alloc_typed::<Tcb>();
     let ipc_buffer_paddr = arena.alloc_page_paddr();
+    let rootserver_stack_paddr = arena.alloc_page_paddr();
 
     log::info!(
-        "[boot] allocated boot objects: bootinfo={:#x}, cnode={:#x} (slots={}), tcb={:#x}, ipc={:#x}",
+        "[boot] allocated boot objects: bootinfo={:#x}, cnode={:#x} (slots={}), tcb={:#x}, ipc={:#x}, rootserver_stack={:#x}",
         bootinfo_ptr.as_ptr() as usize,
         root_cnode_ptr.as_ptr() as usize,
         config::ROOT_CNODE_SLOTS,
         root_tcb_ptr.as_ptr() as usize,
         ipc_buffer_paddr,
+        rootserver_stack_paddr,
     );
 
     let bootinfo = unsafe { &mut *bootinfo_ptr.as_ptr() };
@@ -203,7 +241,7 @@ pub fn bootstrap() {
     );
 
     let untyped_start = BootArena::align_up(arena.cursor(), config::PAGE_SIZE);
-    let first_untyped_slot = populate_user_image_frame_caps(root_cnode, bootinfo);
+    let first_untyped_slot = populate_user_image_frame_caps(rootserver, root_cnode, bootinfo);
     populate_untyped_caps(
         untyped_start,
         free_memory_end,
@@ -213,13 +251,30 @@ pub fn bootstrap() {
     );
 
     bootinfo.init_thread_cnode_size_bits = config::ROOT_CNODE_RADIX_BITS;
+
+    prepare_rootserver_context(root_tcb, rootserver, rootserver_stack_paddr);
+    enter_rootserver(root_tcb)
 }
 
-fn probe_free_memory() -> (usize, usize) {
-    // [__end, __end + EARLY_BOOT_MEMORY_SIZE) is treated as free memory for early boot.
+pub fn locate_rootserver() -> RootserverImage {
+    let image = tg_linker::AppMeta::locate()
+        .iter()
+        .next()
+        .expect("rootserver image missing");
+    RootserverImage {
+        start: image.as_ptr() as usize,
+        end: image.as_ptr() as usize + image.len(),
+    }
+}
+
+fn probe_free_memory(rootserver: RootserverImage) -> (usize, usize) {
+    // The rootserver image is already copied to its fixed run address by
+    // AppMeta::iter(), so boot-time free memory starts after whichever is later:
+    // the kernel image end or the rootserver image end.
     let locate = tg_linker::KernelLayout::locate();
-    let free_memory_start = locate.end();
-    let free_memory_end = free_memory_start + config::EARLY_BOOT_MEMORY_SIZE;
+    let kernel_end = locate.end();
+    let free_memory_start = BootArena::align_up(kernel_end.max(rootserver.end), config::PAGE_SIZE);
+    let free_memory_end = kernel_end + config::EARLY_BOOT_MEMORY_SIZE;
     (free_memory_start, free_memory_end)
 }
 
@@ -275,19 +330,109 @@ fn install_initial_caps(
         }),
         mdb: crate::cap::MDBNode::empty(),
     };
+
+    // Fixed boot-time contract:
+    // - BOOTINFO_FRAME points at the BootInfo page itself.
+    // - IPC_BUFFER points at rootserver's initial IPC buffer page.
+    // - user_image_frames starts after these fixed slots and covers only the
+    //   loaded rootserver image pages.
 }
 
-fn populate_user_image_frame_caps(cnode: &mut [Slot], bootinfo: &mut BootInfo) -> usize {
-    let start = config::FIRST_USER_IMAGE_FRAME_SLOT;
-    let end = start;
+fn prepare_rootserver_context(tcb: &mut Tcb, image: RootserverImage, stack_paddr: usize) {
+    let mut ctx = LocalContext::user(image.start);
+    *ctx.sp_mut() = stack_paddr + config::ROOTSERVER_STACK_SIZE;
 
-    // TODO: Populate root task image frame caps once ELF physical extents are tracked.
+    tcb.ctx = ctx;
+    tcb.state = crate::cap::threads::ThreadState::Running;
+
+    log::info!(
+        "[boot] prepared rootserver context: pc={:#x}, sp={:#x}",
+        tcb.ctx.pc(),
+        tcb.ctx.sp()
+    );
+}
+
+fn enter_rootserver(tcb: &mut Tcb) -> ! {
+    log::info!("[boot] entering rootserver");
+    let saved_stvec = stvec::read();
+    let sstatus = unsafe { tcb.ctx.execute() };
+    let saved_mode = saved_stvec
+        .trap_mode()
+        .expect("unexpected stvec mode before entering rootserver");
+    unsafe { stvec::write(saved_stvec.address(), saved_mode) };
+    handle_rootserver_trap(tcb, sstatus)
+}
+
+#[inline]
+fn handle_rootserver_trap(tcb: &mut Tcb, sstatus: usize) -> ! {
+    let cause = scause::read().cause();
+    let stval = stval::read();
+    let pc = tcb.ctx.pc();
+
+    match cause {
+        Trap::Exception(Exception::UserEnvCall) => {
+            let syscall_id = tcb.ctx.a(7);
+            tcb.ctx.move_next();
+            log::info!(
+                "[boot] rootserver ecall: pc={:#x}, a7={:#x}, next_pc={:#x}, sstatus={:#x}",
+                pc,
+                syscall_id,
+                tcb.ctx.pc(),
+                sstatus,
+            );
+            shutdown(false)
+        }
+        Trap::Exception(exception) => {
+            log::error!(
+                "[boot] rootserver fault: pc={:#x}, stval={:#x}, cause={exception:?}, sstatus={:#x}",
+                pc,
+                stval,
+                sstatus,
+            );
+            shutdown(true)
+        }
+        Trap::Interrupt(interrupt) => {
+            log::error!(
+                "[boot] rootserver interrupt: pc={:#x}, stval={:#x}, cause={interrupt:?}, sstatus={:#x}",
+                pc,
+                stval,
+                sstatus,
+            );
+            shutdown(true)
+        }
+    }
+}
+
+fn populate_user_image_frame_caps(
+    image: RootserverImage,
+    cnode: &mut [Slot],
+    bootinfo: &mut BootInfo,
+) -> usize {
+    let start = config::FIRST_USER_IMAGE_FRAME_SLOT;
+    let image_start = image.start & !(config::PAGE_SIZE - 1);
+    let image_end = BootArena::align_up(image.end, config::PAGE_SIZE);
+    let frame_count = image_end.saturating_sub(image_start) / config::PAGE_SIZE;
+    let end = start + frame_count;
+
+    assert!(
+        end <= config::ROOT_CNODE_SLOTS,
+        "rootserver image frame caps exceed root cnode capacity"
+    );
+
+    for (i, paddr) in (image_start..image_end).step_by(config::PAGE_SIZE).enumerate() {
+        cnode[start + i] = Slot {
+            cap: Capability::Frame(FrameCap {
+                paddr,
+                size_bits: config::MIN_UNTYPED_SIZE_BITS,
+            }),
+            mdb: crate::cap::MDBNode::empty(),
+        };
+    }
+
     bootinfo.user_image_frames = SlotRegion {
         start: CPtr::new(start),
         end: CPtr::new(end),
     };
-
-    let _ = cnode;
 
     end
 }
@@ -338,6 +483,16 @@ fn populate_untyped_caps(
         start: CPtr::new(first_untyped_slot),
         end: CPtr::new(first_untyped_slot + count),
     };
+
+    log::info!(
+        "[boot] bootinfo regions: user_image=[{}, {}), untyped=[{}, {}), empty=[{}, {})",
+        config::FIRST_USER_IMAGE_FRAME_SLOT,
+        first_untyped_slot,
+        first_untyped_slot,
+        first_untyped_slot + count,
+        first_untyped_slot + count,
+        config::ROOT_CNODE_SLOTS,
+    );
 }
 
 /*

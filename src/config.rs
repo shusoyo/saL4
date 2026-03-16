@@ -13,6 +13,7 @@ pub const ROOT_CNODE_SLOT_BOOTINFO_FRAME: usize = 4;
 pub const ROOT_CNODE_SLOT_IPC_BUFFER: usize = 5;
 
 pub const FIRST_USER_IMAGE_FRAME_SLOT: usize = ROOT_CNODE_SLOT_IPC_BUFFER + 1;
+pub const ROOTSERVER_STACK_SIZE: usize = PAGE_SIZE;
 
 /// Early-boot RAM budget used by the tutorial kernel on QEMU.
 ///
