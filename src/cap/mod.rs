@@ -25,11 +25,22 @@ pub struct TCBCap {
 }
 
 #[derive(Debug, Copy, Clone)]
+pub struct IRQControlCap;
+
+#[derive(Debug, Copy, Clone)]
+pub struct FrameCap {
+    pub paddr: usize,
+    pub size_bits: u8,
+}
+
+#[derive(Debug, Copy, Clone)]
 pub enum Capability {
     Null,
     Untyped(UntypedCap),
     CNode(CNodeCap),
     Tcb(TCBCap),
+    IRQControl(IRQControlCap),
+    Frame(FrameCap),
 }
 
 #[derive(Debug, Copy, Clone)]

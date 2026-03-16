@@ -41,6 +41,7 @@ pub fn rust_main() -> ! {
     tg_console::test_log();
 
     // boot
+    boot::bootstrap();
 
     log::info!("hello, world");
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::cap::{CNodeCap, Capability, Slot};
 
 #[repr(transparent)]
