@@ -42,6 +42,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
  "riscv",
+ "sal4-common",
  "tg-rcore-tutorial-console",
  "tg-rcore-tutorial-kernel-context",
  "tg-rcore-tutorial-linker",
@@ -97,6 +98,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rootserver"
+version = "0.1.0"
+dependencies = [
+ "sal4-common",
+]
+
+[[package]]
+name = "sal4-common"
+version = "0.1.0"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -113,9 +125,9 @@ dependencies = [
 
 [[package]]
 name = "tg-rcore-tutorial-console"
-version = "0.4.5"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d551caaad4cdc01fa6e4ebb9a2492c9c0ee344edfeea0d80d9b6cc81dc53dd7d"
+checksum = "33af8c7a47caa3e38b43f153a3065d1edc33b2509964e3a88a4596b272b408de"
 dependencies = [
  "log",
  "spin",
@@ -123,21 +135,21 @@ dependencies = [
 
 [[package]]
 name = "tg-rcore-tutorial-kernel-context"
-version = "0.4.5"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b118b8686bc4125b119c1a780c961e0ddcfa8762cf4cd6bbcc58757912e4c513"
+checksum = "c86a06032213c9c08e8ea8ef7acb5612f6abededa6fd3fc663b03d0bcae49fab"
 
 [[package]]
 name = "tg-rcore-tutorial-linker"
-version = "0.4.5"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6af61169c1d6252d3d2124b83ae97791e5407521bd3f2cf06fe62e3f3cc059a8"
+checksum = "63b199183449ed076ff8f3e23e4389a264256ad9a3674da7444d4e93994c8cdd"
 
 [[package]]
 name = "tg-rcore-tutorial-sbi"
-version = "0.4.5"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f8ca79f0f7ce4ec4889134a0553dc103a3f8230b5113ae8ee651db70cdad7e0"
+checksum = "2b7b393aa703ee8b3a8598fb8937f632bdb610619f6d0242b6fcabb663243cb0"
 
 [[package]]
 name = "tg-rcore-tutorial-signal-defs"

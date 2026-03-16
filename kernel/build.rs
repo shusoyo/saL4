@@ -23,8 +23,12 @@ fn write_linker() {
 
 fn build_rootserver() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let rootserver_root = manifest_dir.join("rootserver");
+    let workspace_root = manifest_dir
+        .parent()
+        .expect("kernel crate should live under the workspace root");
+    let rootserver_root = workspace_root.join("rootserver");
     let rootserver_manifest = rootserver_root.join("Cargo.toml");
+    let rootserver_target_dir = workspace_root.join("target").join("rootserver-build");
     println!("cargo:rerun-if-changed={}", rootserver_manifest.display());
     println!(
         "cargo:rerun-if-changed={}",
@@ -44,14 +48,14 @@ fn build_rootserver() {
             TARGET_ARCH,
         ])
         .env("BASE_ADDRESS", ROOTSERVER_BASE_ADDRESS.to_string())
+        .env("CARGO_TARGET_DIR", &rootserver_target_dir)
         .status()
         .expect("failed to execute cargo build for rootserver");
     if !status.success() {
         panic!("failed to build rootserver");
     }
 
-    let elf = rootserver_root
-        .join("target")
+    let elf = rootserver_target_dir
         .join(TARGET_ARCH)
         .join("debug")
         .join("rootserver");

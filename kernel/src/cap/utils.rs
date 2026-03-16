@@ -1,16 +1,7 @@
 #![allow(dead_code)]
 
 use crate::cap::{CNodeCap, Capability, Slot};
-
-#[repr(transparent)]
-#[derive(Debug, Eq, PartialEq)]
-pub struct CPtr(usize);
-
-impl CPtr {
-    pub const fn new(raw: usize) -> Self {
-        Self(raw)
-    }
-}
+pub use sal4_common::CPtr;
 
 pub fn resolve_cptr(root: &CNodeCap, cptr: CPtr, mut bits_left: u32) -> Result<Slot, LookupError> {
     let safed_minus = |bits_left: u32, match_size: u32| {
@@ -23,7 +14,8 @@ pub fn resolve_cptr(root: &CNodeCap, cptr: CPtr, mut bits_left: u32) -> Result<S
 
     bits_left = safed_minus(bits_left, root.guard_size as u32)?;
 
-    let flag = cptr.0 >> (bits_left) & ((1 << root.guard_size) - 1);
+    let raw = cptr.raw();
+    let flag = raw >> bits_left & ((1 << root.guard_size) - 1);
 
     if flag != root.guard {
         return Err(LookupError::GuardMismatch);
@@ -31,7 +23,7 @@ pub fn resolve_cptr(root: &CNodeCap, cptr: CPtr, mut bits_left: u32) -> Result<S
 
     bits_left = safed_minus(bits_left, root.radix_bits as u32)?;
 
-    let index = (cptr.0 >> bits_left) & ((1 << root.radix_bits) - 1);
+    let index = (raw >> bits_left) & ((1 << root.radix_bits) - 1);
 
     let target = unsafe { root.storage.as_ptr().add(index).read() };
 

@@ -1,172 +1,20 @@
 #![allow(dead_code)]
 
+mod mm;
+mod rootserver;
+
 use crate::{
     cap::{CNodeCap, Capability, FrameCap, IRQControlCap, Slot, TCBCap, UntypedCap, threads::Tcb},
     config,
-    utils::CPtr,
 };
-use core::{
-    mem::{align_of, size_of},
-    ptr::NonNull,
+use mm::{BootArena, UntypedStream, probe_free_memory};
+
+use core::ptr::NonNull;
+use rootserver::{
+    RootserverImage, enter_rootserver, locate_rootserver, prepare_rootserver_context,
 };
-use riscv::register::{
-    scause::{self, Exception, Trap},
-    stval, stvec,
-};
+use sal4_common::{BootInfo, CPtr, SlotRegion};
 use tg_console::log;
-use tg_kernel_context::LocalContext;
-use tg_sbi::shutdown;
-
-#[derive(Debug, Copy, Clone)]
-pub struct RootserverImage {
-    pub start: usize,
-    pub end: usize,
-}
-
-impl RootserverImage {
-    pub const fn size(&self) -> usize {
-        self.end - self.start
-    }
-}
-
-struct BootArena {
-    current: usize,
-    end: usize,
-}
-
-impl BootArena {
-    fn new(start: usize, end: usize) -> Self {
-        Self {
-            current: Self::align_up(start, config::PAGE_SIZE),
-            end,
-        }
-    }
-
-    fn align_up(x: usize, align: usize) -> usize {
-        assert!(align.is_power_of_two(), "align must be 2^n");
-        x.checked_add(align - 1).expect("overflow") & !(align - 1)
-    }
-
-    fn alloc_typed<T>(&mut self) -> NonNull<T> {
-        let align = align_of::<T>();
-
-        let size = size_of::<T>();
-        assert!(align != 0, "align must not be zero");
-
-        self.current = Self::align_up(self.current, align);
-        let ptr = self.current as *mut T;
-        self.current += size;
-        assert!(self.current <= self.end, "Out of memory during bootstrap");
-
-        unsafe {
-            // Boot-time kernel objects start from a deterministic zeroed state.
-            core::ptr::write_bytes(ptr, 0, 1);
-            NonNull::new_unchecked(ptr)
-        }
-    }
-
-    fn alloc_slots(&mut self, count: usize) -> NonNull<Slot> {
-        let align = align_of::<Slot>();
-        assert!(align != 0, "align must not be zero");
-
-        self.current = Self::align_up(self.current, align);
-        let ptr = self.current as *mut Slot;
-
-        self.current += size_of::<Slot>() * count;
-        assert!(self.current <= self.end, "Out of memory during bootstrap");
-
-        unsafe {
-            core::ptr::write_bytes(ptr, 0, count);
-            NonNull::new_unchecked(ptr)
-        }
-    }
-
-    fn alloc_page_paddr(&mut self) -> usize {
-        self.current = Self::align_up(self.current, config::PAGE_SIZE);
-        let paddr = self.current;
-        self.current += config::PAGE_SIZE;
-        assert!(self.current <= self.end, "Out of memory during bootstrap");
-
-        unsafe {
-            core::ptr::write_bytes(paddr as *mut u8, 0, config::PAGE_SIZE);
-        }
-
-        paddr
-    }
-
-    fn cursor(&self) -> usize {
-        self.current
-    }
-}
-
-struct UntypedStream {
-    current_paddr: usize,
-    end_paddr: usize,
-}
-
-impl Iterator for UntypedStream {
-    type Item = (usize, u8);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let remain = self.end_paddr.saturating_sub(self.current_paddr);
-        if remain < config::PAGE_SIZE {
-            return None;
-        }
-
-        // Keep untyped in 2^n sizes (seL4-like model), but use clear arithmetic checks
-        let s_paddr_bits = self.current_paddr.trailing_zeros();
-        let remain_bits = remain.ilog2();
-        let size_bits = s_paddr_bits.min(remain_bits);
-
-        let paddr = self.current_paddr;
-        self.current_paddr += 1usize << size_bits;
-        Some((paddr, size_bits as u8))
-    }
-}
-
-#[repr(C)]
-pub struct SlotRegion {
-    /// Inclusive start slot index in the root cnode.
-    pub start: CPtr,
-    /// Exclusive end slot index in the root cnode.
-    pub end: CPtr,
-}
-
-#[repr(C, align(4096))]
-pub struct BootInfo {
-    // pub node_id: usize,
-    // pub num_nodes: usize,
-    // pub ipc_buffer_vaddr: usize,
-    /// Radix bits of the initial thread's root cnode.
-    pub init_thread_cnode_size_bits: u8,
-
-    /// Unused root cnode slots available after bootstrap.
-    ///
-    /// `empty.start` is the first slot not consumed by the fixed boot-time
-    /// allocations below (`TCB`, `CNode`, `IRQ control`, `BootInfo` frame,
-    /// IPC buffer frame, rootserver image frames, exported untyped caps).
-    pub empty: SlotRegion,
-    /// Root cnode slots describing the loaded rootserver image frames.
-    ///
-    /// This region covers only the boot-time rootserver image that the kernel
-    /// copies to its fixed run address. It does not describe the BootInfo
-    /// frame, IPC buffer frame, rootserver stack, or any future user images
-    /// loaded by rootserver itself.
-    pub user_image_frames: SlotRegion,
-    /// Root cnode slots holding the exported untyped capabilities.
-    ///
-    /// This region starts after the fixed boot-time objects and excludes the
-    /// rootserver image, BootInfo frame, IPC buffer frame, and rootserver
-    /// stack reserved during bootstrap.
-    pub untyped: SlotRegion,
-
-    /// Physical base address of each exported untyped capability.
-    pub untyped_paddr_list: [usize; config::MAX_UNTYPED_OBJECTS],
-    /// Size bits of each exported untyped capability.
-    pub untyped_size_bits_list: [u8; config::MAX_UNTYPED_OBJECTS],
-    // pub fdt_paddr: usize,
-    // pub fdt_size: usize,
-}
 
 const _: () = {
     assert!(config::ROOT_CNODE_SLOTS == (1usize << config::ROOT_CNODE_RADIX_BITS));
@@ -250,32 +98,18 @@ pub fn bootstrap() -> ! {
         bootinfo,
     );
 
+    bootinfo.ipc_buffer = ipc_buffer_paddr;
     bootinfo.init_thread_cnode_size_bits = config::ROOT_CNODE_RADIX_BITS;
 
-    prepare_rootserver_context(root_tcb, rootserver, rootserver_stack_paddr);
+    prepare_rootserver_context(
+        root_tcb,
+        rootserver,
+        rootserver_stack_paddr,
+        bootinfo_ptr.as_ptr() as usize,
+        ipc_buffer_paddr,
+    );
+
     enter_rootserver(root_tcb)
-}
-
-pub fn locate_rootserver() -> RootserverImage {
-    let image = tg_linker::AppMeta::locate()
-        .iter()
-        .next()
-        .expect("rootserver image missing");
-    RootserverImage {
-        start: image.as_ptr() as usize,
-        end: image.as_ptr() as usize + image.len(),
-    }
-}
-
-fn probe_free_memory(rootserver: RootserverImage) -> (usize, usize) {
-    // The rootserver image is already copied to its fixed run address by
-    // AppMeta::iter(), so boot-time free memory starts after whichever is later:
-    // the kernel image end or the rootserver image end.
-    let locate = tg_linker::KernelLayout::locate();
-    let kernel_end = locate.end();
-    let free_memory_start = BootArena::align_up(kernel_end.max(rootserver.end), config::PAGE_SIZE);
-    let free_memory_end = kernel_end + config::EARLY_BOOT_MEMORY_SIZE;
-    (free_memory_start, free_memory_end)
 }
 
 fn install_initial_caps(
@@ -338,71 +172,6 @@ fn install_initial_caps(
     //   loaded rootserver image pages.
 }
 
-fn prepare_rootserver_context(tcb: &mut Tcb, image: RootserverImage, stack_paddr: usize) {
-    let mut ctx = LocalContext::user(image.start);
-    *ctx.sp_mut() = stack_paddr + config::ROOTSERVER_STACK_SIZE;
-
-    tcb.ctx = ctx;
-    tcb.state = crate::cap::threads::ThreadState::Running;
-
-    log::info!(
-        "[boot] prepared rootserver context: pc={:#x}, sp={:#x}",
-        tcb.ctx.pc(),
-        tcb.ctx.sp()
-    );
-}
-
-fn enter_rootserver(tcb: &mut Tcb) -> ! {
-    log::info!("[boot] entering rootserver");
-    let saved_stvec = stvec::read();
-    let sstatus = unsafe { tcb.ctx.execute() };
-    let saved_mode = saved_stvec
-        .trap_mode()
-        .expect("unexpected stvec mode before entering rootserver");
-    unsafe { stvec::write(saved_stvec.address(), saved_mode) };
-    handle_rootserver_trap(tcb, sstatus)
-}
-
-#[inline]
-fn handle_rootserver_trap(tcb: &mut Tcb, sstatus: usize) -> ! {
-    let cause = scause::read().cause();
-    let stval = stval::read();
-    let pc = tcb.ctx.pc();
-
-    match cause {
-        Trap::Exception(Exception::UserEnvCall) => {
-            let syscall_id = tcb.ctx.a(7);
-            tcb.ctx.move_next();
-            log::info!(
-                "[boot] rootserver ecall: pc={:#x}, a7={:#x}, next_pc={:#x}, sstatus={:#x}",
-                pc,
-                syscall_id,
-                tcb.ctx.pc(),
-                sstatus,
-            );
-            shutdown(false)
-        }
-        Trap::Exception(exception) => {
-            log::error!(
-                "[boot] rootserver fault: pc={:#x}, stval={:#x}, cause={exception:?}, sstatus={:#x}",
-                pc,
-                stval,
-                sstatus,
-            );
-            shutdown(true)
-        }
-        Trap::Interrupt(interrupt) => {
-            log::error!(
-                "[boot] rootserver interrupt: pc={:#x}, stval={:#x}, cause={interrupt:?}, sstatus={:#x}",
-                pc,
-                stval,
-                sstatus,
-            );
-            shutdown(true)
-        }
-    }
-}
-
 fn populate_user_image_frame_caps(
     image: RootserverImage,
     cnode: &mut [Slot],
@@ -419,7 +188,10 @@ fn populate_user_image_frame_caps(
         "rootserver image frame caps exceed root cnode capacity"
     );
 
-    for (i, paddr) in (image_start..image_end).step_by(config::PAGE_SIZE).enumerate() {
+    for (i, paddr) in (image_start..image_end)
+        .step_by(config::PAGE_SIZE)
+        .enumerate()
+    {
         cnode[start + i] = Slot {
             cap: Capability::Frame(FrameCap {
                 paddr,

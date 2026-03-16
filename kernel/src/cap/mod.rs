@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod threads;
+pub mod utils;
 
 use core::ptr::NonNull;
 

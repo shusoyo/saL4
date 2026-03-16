@@ -4,10 +4,5 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-
 [dependencies]
+sal4-common = { path = "../sal4-common" }

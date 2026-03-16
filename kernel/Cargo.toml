@@ -1,0 +1,22 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+riscv = "0.10.1"
+bitflags = "2.11.0"
+sal4-common = { path = "../sal4-common" }
+
+tg-sbi = { package = "tg-rcore-tutorial-sbi", version = "0.4.5", features = [
+  "nobios",
+] }
+tg-linker = { package = "tg-rcore-tutorial-linker", version = "0.4.5" }
+tg-console = { package = "tg-rcore-tutorial-console", version = "0.4.5" }
+tg-kernel-context = { package = "tg-rcore-tutorial-kernel-context", version = "0.4.5" }
+tg-syscall = { package = "tg-rcore-tutorial-syscall", version = "0.4.5", features = [
+  "kernel",
+] }
+
+[build-dependencies]
+tg-linker = { package = "tg-rcore-tutorial-linker", version = "0.4.5" }

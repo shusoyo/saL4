@@ -10,7 +10,6 @@ mod boot;
 mod cap;
 mod config;
 mod impls;
-mod utils;
 
 use impls::Console;
 

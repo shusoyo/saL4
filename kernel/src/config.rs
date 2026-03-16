@@ -3,7 +3,7 @@ pub const MIN_UNTYPED_SIZE_BITS: u8 = 12;
 
 pub const ROOT_CNODE_RADIX_BITS: u8 = 8;
 pub const ROOT_CNODE_SLOTS: usize = 1usize << ROOT_CNODE_RADIX_BITS;
-pub const MAX_UNTYPED_OBJECTS: usize = 128;
+pub const MAX_UNTYPED_OBJECTS: usize = sal4_common::MAX_UNTYPED_OBJECTS;
 
 pub const ROOT_CNODE_SLOT_NULL: usize = 0;
 pub const ROOT_CNODE_SLOT_TCB: usize = 1;
