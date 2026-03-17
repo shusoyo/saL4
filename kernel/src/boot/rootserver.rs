@@ -1,11 +1,12 @@
 use crate::{
     cap::threads::{Tcb, ThreadState},
     config,
+    syscall::handle_syscall,
 };
 
 use riscv::register::{
     scause::{self, Exception, Trap},
-    stval, stvec,
+    stval,
 };
 use tg_console::log;
 use tg_kernel_context::LocalContext;
@@ -60,35 +61,22 @@ pub fn prepare_rootserver_context(
 
 pub fn enter_rootserver(tcb: &mut Tcb) -> ! {
     log::info!("[boot] entering rootserver");
-    let saved_stvec = stvec::read();
-    let sstatus = unsafe { tcb.ctx.execute() };
-    let saved_mode = saved_stvec
-        .trap_mode()
-        .expect("unexpected stvec mode before entering rootserver");
-    unsafe { stvec::write(saved_stvec.address(), saved_mode) };
-    handle_rootserver_trap(tcb, sstatus)
+
+    loop {
+        let sstatus = unsafe { tcb.ctx.execute() };
+        handle_rootserver_trap(tcb, sstatus)
+    }
 }
 
-#[inline]
-fn handle_rootserver_trap(tcb: &mut Tcb, sstatus: usize) -> ! {
+fn handle_rootserver_trap(tcb: &mut Tcb, sstatus: usize) {
     let cause = scause::read().cause();
     let stval = stval::read();
     let pc = tcb.ctx.pc();
 
     match cause {
         Trap::Exception(Exception::UserEnvCall) => {
-            let syscall_id = tcb.ctx.a(7);
             tcb.ctx.move_next();
-            log::info!(
-                "[boot] rootserver ecall: pc={:#x}, a0(bootinfo)={:#x}, a1(ipc)={:#x}, a7={:#x}, next_pc={:#x}, sstatus={:#x}",
-                pc,
-                tcb.ctx.a(0),
-                tcb.ctx.a(1),
-                syscall_id,
-                tcb.ctx.pc(),
-                sstatus,
-            );
-            shutdown(false)
+            handle_syscall(&tcb.ctx);
         }
         Trap::Exception(exception) => {
             log::error!(

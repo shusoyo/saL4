@@ -10,10 +10,12 @@ mod boot;
 mod cap;
 mod config;
 mod impls;
+mod syscall;
 
 use impls::Console;
 
 core::arch::global_asm!(include_str!("entry.asm"));
+const _: &str = env!("ROOTSERVER_IMAGE_STAMP");
 core::arch::global_asm!(include_str!(env!("APP_ASM")));
 
 /// S 态主函数：完成最早期初始化后进入内核 boot 流程。

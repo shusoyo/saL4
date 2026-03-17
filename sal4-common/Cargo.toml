@@ -5,3 +5,7 @@ edition = "2024"
 
 [lib]
 path = "src/lib.rs"
+
+
+[dependencies]
+tg-syscall = { package = "tg-rcore-tutorial-syscall", version = "0.4.5" }

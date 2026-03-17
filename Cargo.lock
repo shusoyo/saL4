@@ -102,11 +102,16 @@ name = "rootserver"
 version = "0.1.0"
 dependencies = [
  "sal4-common",
+ "tg-rcore-tutorial-console",
+ "tg-rcore-tutorial-syscall",
 ]
 
 [[package]]
 name = "sal4-common"
 version = "0.1.0"
+dependencies = [
+ "tg-rcore-tutorial-syscall",
+]
 
 [[package]]
 name = "scopeguard"

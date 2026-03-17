@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod sal4_syscall;
+
 pub const MAX_UNTYPED_OBJECTS: usize = 128;
 
 #[repr(transparent)]
