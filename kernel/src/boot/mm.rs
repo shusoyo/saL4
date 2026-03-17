@@ -109,5 +109,15 @@ pub fn probe_free_memory(rootserver: RootserverImage) -> (usize, usize) {
     let kernel_end = locate.end();
     let free_memory_start = BootArena::align_up(kernel_end.max(rootserver.end), config::PAGE_SIZE);
     let free_memory_end = kernel_end + config::EARLY_BOOT_MEMORY_SIZE;
+
+    assert!(
+        free_memory_start <= free_memory_end,
+        "rootserver image at [{:#x}, {:#x}) exceeds the early-boot memory window [{:#x}, {:#x})",
+        rootserver.start,
+        rootserver.end,
+        kernel_end,
+        free_memory_end,
+    );
+
     (free_memory_start, free_memory_end)
 }
