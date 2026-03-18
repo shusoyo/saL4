@@ -1,4 +1,7 @@
-use crate::{cap::Slot, config};
+use crate::{
+    cap::{Slot, utils::align_up},
+    config,
+};
 
 use core::{
     mem::{align_of, size_of},
@@ -15,14 +18,9 @@ pub struct BootArena {
 impl BootArena {
     pub fn new(start: usize, end: usize) -> Self {
         Self {
-            current: Self::align_up(start, config::PAGE_SIZE),
+            current: align_up(start, config::PAGE_SIZE),
             end,
         }
-    }
-
-    pub fn align_up(x: usize, align: usize) -> usize {
-        assert!(align.is_power_of_two(), "align must be 2^n");
-        x.checked_add(align - 1).expect("overflow") & !(align - 1)
     }
 
     pub fn alloc_typed<T>(&mut self) -> NonNull<T> {
@@ -30,7 +28,7 @@ impl BootArena {
         let size = size_of::<T>();
         assert!(align != 0, "align must not be zero");
 
-        self.current = Self::align_up(self.current, align);
+        self.current = align_up(self.current, align);
         let ptr = self.current as *mut T;
         self.current += size;
         assert!(self.current <= self.end, "Out of memory during bootstrap");
@@ -46,7 +44,7 @@ impl BootArena {
         let align = align_of::<Slot>();
         assert!(align != 0, "align must not be zero");
 
-        self.current = Self::align_up(self.current, align);
+        self.current = align_up(self.current, align);
         let ptr = self.current as *mut Slot;
 
         self.current += size_of::<Slot>() * count;
@@ -59,7 +57,7 @@ impl BootArena {
     }
 
     pub fn alloc_page_paddr(&mut self) -> usize {
-        self.current = Self::align_up(self.current, config::PAGE_SIZE);
+        self.current = align_up(self.current, config::PAGE_SIZE);
         let paddr = self.current;
         self.current += config::PAGE_SIZE;
         assert!(self.current <= self.end, "Out of memory during bootstrap");
@@ -107,7 +105,7 @@ pub fn probe_free_memory(rootserver: RootserverImage) -> (usize, usize) {
     // the kernel image end or the rootserver image end.
     let locate = tg_linker::KernelLayout::locate();
     let kernel_end = locate.end();
-    let free_memory_start = BootArena::align_up(kernel_end.max(rootserver.end), config::PAGE_SIZE);
+    let free_memory_start = align_up(kernel_end.max(rootserver.end), config::PAGE_SIZE);
     let free_memory_end = kernel_end + config::EARLY_BOOT_MEMORY_SIZE;
 
     assert!(

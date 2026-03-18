@@ -76,7 +76,7 @@ fn handle_rootserver_trap(tcb: &mut Tcb, sstatus: usize) {
     match cause {
         Trap::Exception(Exception::UserEnvCall) => {
             tcb.ctx.move_next();
-            handle_syscall(&tcb.ctx);
+            handle_syscall(tcb);
         }
         Trap::Exception(exception) => {
             log::error!(

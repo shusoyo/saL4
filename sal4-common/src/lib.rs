@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod invocation;
 pub mod sal4_syscall;
 
 pub const MAX_UNTYPED_OBJECTS: usize = 128;
@@ -15,6 +16,13 @@ impl CPtr {
 
     pub const fn raw(self) -> usize {
         self.0
+    }
+}
+
+impl From<usize> for CPtr {
+    #[inline]
+    fn from(val: usize) -> Self {
+        Self(val)
     }
 }
 

@@ -31,7 +31,7 @@ pub fn rust_main() -> ! {
 
     // 第二步：初始化控制台输出（使 print!/println! 可用）
     tg_console::init_console(&Console);
-    tg_console::set_log_level(option_env!("LOG"));
+    tg_console::set_log_level(option_env!("LOG").or(Some("DEBUG")));
     tg_console::test_log();
 
     // Enter the kernel boot flow. From this point on the kernel should not

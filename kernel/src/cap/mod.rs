@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod invocation;
 pub mod threads;
 pub mod utils;
 
@@ -10,6 +11,7 @@ pub struct UntypedCap {
     pub paddr: usize,
     pub size_bits: u8,
     pub is_device: bool,
+    pub free_offset: usize,
 }
 
 #[derive(Debug, Copy, Clone)]

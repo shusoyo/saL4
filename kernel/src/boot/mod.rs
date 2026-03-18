@@ -4,7 +4,10 @@ mod mm;
 mod rootserver;
 
 use crate::{
-    cap::{CNodeCap, Capability, FrameCap, IRQControlCap, Slot, TCBCap, UntypedCap, threads::Tcb},
+    cap::{
+        CNodeCap, Capability, FrameCap, IRQControlCap, Slot, TCBCap, UntypedCap, threads::Tcb,
+        utils::align_up,
+    },
     config,
 };
 use mm::{BootArena, UntypedStream, probe_free_memory};
@@ -88,7 +91,7 @@ pub fn bootstrap() -> ! {
         ipc_buffer_paddr,
     );
 
-    let untyped_start = BootArena::align_up(arena.cursor(), config::PAGE_SIZE);
+    let untyped_start = align_up(arena.cursor(), config::PAGE_SIZE);
     let first_untyped_slot = populate_user_image_frame_caps(rootserver, root_cnode, bootinfo);
     populate_untyped_caps(
         untyped_start,
@@ -179,7 +182,7 @@ fn populate_user_image_frame_caps(
 ) -> usize {
     let start = config::FIRST_USER_IMAGE_FRAME_SLOT;
     let image_start = image.start & !(config::PAGE_SIZE - 1);
-    let image_end = BootArena::align_up(image.end, config::PAGE_SIZE);
+    let image_end = align_up(image.end, config::PAGE_SIZE);
     let frame_count = image_end.saturating_sub(image_start) / config::PAGE_SIZE;
     let end = start + frame_count;
 
@@ -238,6 +241,7 @@ fn populate_untyped_caps(
                 paddr,
                 size_bits,
                 is_device: false,
+                free_offset: 0,
             }),
             mdb: crate::cap::MDBNode::empty(),
         };
